@@ -1,6 +1,6 @@
-import 'dotenv/config';
+import { env } from '../server/env';
 
-const key = process.env.OPENAI_API_KEY?.trim();
+const key = env.OPENAI_API_KEY?.trim();
 
 if (!key || key.length <= 20) {
   console.error('[env] Missing OPENAI_API_KEY. Copy .env.example -> .env and set your key.');

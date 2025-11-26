@@ -1,4 +1,3 @@
-import 'dotenv/config';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import express from 'express';
@@ -13,18 +12,14 @@ import { buildSystem } from '../src/lib/systemDebug';
 import { fallbackSystemPrompt } from './prompts/system.private';
 import { resolveModel } from './modelRegistry';
 import { safeEnv } from './utils/safeEnv';
+import { env } from './env';
+import { chatRequestSchema } from './schemas';
+import { createSession, destroySession, getSession, SESSION_TTL_MS } from './sessionStore';
 
-/*
-Instruções rápidas:
-- Copie `.env.example` para `.env`, defina OPENAI_API_KEY=sk-******************************* e rode `npm run preflight`.
-- `npm run dev` executa o preflight antes de subir o server + Vite; sem a chave o boot é bloqueado com log claro.
-- `GET /api/health` serve apenas como ping (sem revelar segredos).
-*/
-
-const PORT = Number(process.env.PORT) || 3001;
+const PORT = env.PORT;
 const NODE_ENV = process.env.NODE_ENV ?? 'development';
 const DEBUG_ENABLED = process.env.SYSTEM_DEBUG === 'true' && NODE_ENV !== 'production';
-const FALLBACK_FILE_ENV = process.env.SYSTEM_PROMPT_FILE;
+const FALLBACK_FILE_ENV = env.SYSTEM_PROMPT_FILE;
 const rawAllowedOrigins = process.env.CORS_ALLOWED_ORIGINS;
 const allowedOrigins = new Set(
   [
@@ -53,10 +48,9 @@ const isAllowedOrigin = (origin: string) => {
     return false;
   }
 };
-const APP_ACCESS_PASSWORD = process.env.APP_ACCESS_PASSWORD;
-const APP_SESSION_SECRET = process.env.APP_SESSION_SECRET;
-const SESSION_COOKIE_NAME = 'iaengine_session';
-const validSessions = new Set<string>();
+const APP_ACCESS_PASSWORD = env.APP_ACCESS_PASSWORD;
+const APP_SESSION_SECRET = env.APP_SESSION_SECRET;
+const SESSION_COOKIE_NAME = 'session_id';
 
 const chatLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -65,23 +59,14 @@ const chatLimiter = rateLimit({
   legacyHeaders: false
 });
 
-const rawApiKey = process.env.OPENAI_API_KEY?.trim();
-if (!rawApiKey || rawApiKey.length < 20) {
-  console.error('[ENV] Missing OPENAI_API_KEY. Crie .env a partir de .env.example, preencha e reinicie.');
-  process.exit(1);
-}
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false
+});
 
-if (!APP_ACCESS_PASSWORD || APP_ACCESS_PASSWORD.trim().length === 0) {
-  console.error('[ENV] Missing APP_ACCESS_PASSWORD. Defina a senha de acesso no arquivo .env.');
-  process.exit(1);
-}
-
-if (!APP_SESSION_SECRET || APP_SESSION_SECRET.trim().length < 16) {
-  console.error('[ENV] Missing or weak APP_SESSION_SECRET. Defina um valor seguro no arquivo .env.');
-  process.exit(1);
-}
-
-if (DEBUG_ENABLED) {
+if (DEBUG_ENABLED && NODE_ENV !== 'production') {
   console.info('[ENV] snapshot', safeEnv());
 }
 
@@ -108,7 +93,7 @@ app.use(
 app.use(cookieParser(APP_SESSION_SECRET));
 app.use(express.json({ limit: '1mb' }));
 
-const openai = new OpenAI({ apiKey: rawApiKey });
+const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
 
 type IncomingMessage = Partial<ChatCompletionMessageParam>;
 
@@ -135,18 +120,24 @@ const sessionCookieOptions = {
   sameSite: 'lax' as const,
   secure: NODE_ENV === 'production',
   signed: true,
-  path: '/'
+  path: '/',
+  maxAge: SESSION_TTL_MS
 };
 
-const createSessionToken = () =>
-  crypto.createHmac('sha256', APP_SESSION_SECRET as string).update(crypto.randomUUID()).digest('hex');
+const issueSession = (res: Response) => {
+  const session = createSession();
+  res.cookie(SESSION_COOKIE_NAME, session.id, sessionCookieOptions);
+  return session;
+};
 
-const requireAuth: RequestHandler = (req: Request, res: Response, next: NextFunction) => {
+const requireSession: RequestHandler = (req: Request, res: Response, next: NextFunction) => {
   const sessionToken = req.signedCookies?.[SESSION_COOKIE_NAME] as string | undefined;
-  if (!sessionToken || !validSessions.has(sessionToken)) {
+  const session = getSession(sessionToken);
+  if (!session) {
     res.status(401).json({ error: 'unauthorized' });
     return;
   }
+  (req as Request & { session?: typeof session }).session = session;
   next();
 };
 
@@ -179,7 +170,7 @@ const resolveFallbackPrompt = async (): Promise<string> => {
       return cachedFallbackPrompt;
     }
   } catch (error) {
-    console.warn('[SYSTEM] Não foi possível carregar o arquivo definido em SYSTEM_PROMPT_FILE.', error);
+    console.warn('[SYSTEM] Nao foi possivel carregar o arquivo definido em SYSTEM_PROMPT_FILE.', error);
   }
 
   cachedFallbackPrompt = fallbackSystemPrompt;
@@ -206,51 +197,71 @@ interface ChatRequestBody {
   model?: string;
 }
 
-app.post('/api/login', (req: Request, res: Response) => {
+app.post('/api/login', loginLimiter, (req: Request, res: Response) => {
   const password = typeof req.body?.password === 'string' ? req.body.password : '';
+  if (!password) {
+    res.status(400).json({ error: 'missing_password' });
+    return;
+  }
+  if (password !== APP_ACCESS_PASSWORD) {
+    res.status(401).json({ error: 'invalid_credentials' });
+    return;
+  }
+  issueSession(res);
+  res.json({ ok: true });
+});
+
+app.post('/api/auth/login', loginLimiter, (req: Request, res: Response) => {
+  const password = typeof req.body?.password === 'string' ? req.body.password.trim() : '';
+
+  if (!password) {
+    res.status(400).json({ error: 'missing_password' });
+    return;
+  }
+
   if (password !== APP_ACCESS_PASSWORD) {
     res.status(401).json({ error: 'invalid_credentials' });
     return;
   }
 
-  const token = createSessionToken();
-  validSessions.add(token);
-  res.cookie(SESSION_COOKIE_NAME, token, sessionCookieOptions);
+  issueSession(res);
   res.json({ ok: true });
 });
 
-app.post('/api/auth/login', (req: Request, res: Response) => {
-  // console.log('[LOGIN] body recebido:', req.body);
-  const username = typeof req.body?.username === 'string' ? req.body.username.trim() : '';
-  const password = typeof req.body?.password === 'string' ? req.body.password.trim() : '';
-
-  if (username === 'admengine' && password === '1547') {
-    const token = createSessionToken();
-    validSessions.add(token);
-    res.cookie(SESSION_COOKIE_NAME, token, sessionCookieOptions);
-    res.json({ ok: true });
-    return;
-  }
-
-  res.status(401).json({ ok: false, message: 'Credenciais invalidas' });
+app.post('/api/auth/logout', (req: Request, res: Response) => {
+  const sessionId = req.signedCookies?.[SESSION_COOKIE_NAME] as string | undefined;
+  destroySession(sessionId);
+  res.clearCookie(SESSION_COOKIE_NAME, { path: '/', signed: true });
+  res.json({ ok: true });
 });
 
 app.get('/api/session', (req: Request, res: Response) => {
   const token = req.signedCookies?.[SESSION_COOKIE_NAME] as string | undefined;
-  if (token && validSessions.has(token)) {
+  const session = getSession(token);
+  if (session) {
     res.json({ authenticated: true });
     return;
   }
   res.json({ authenticated: false });
 });
 
-app.use('/api/chat', requireAuth, chatLimiter);
+app.use('/api/chat', requireSession, chatLimiter);
 
 app.post('/api/chat', async (req: Request<unknown, unknown, ChatRequestBody>, res: Response) => {
-  const userMessages = sanitizeMessages(req.body?.messages);
-  const requestedModel =
-    typeof req.body?.model === 'string' && req.body.model.trim().length > 0 ? req.body.model.trim() : undefined;
-  const { model: resolvedModel, aliasUsed, warning } = resolveModel(requestedModel);
+  const parsed = chatRequestSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'invalid_payload', issues: parsed.error.format() });
+  }
+
+  const userMessages = sanitizeMessages(parsed.data.messages);
+  const requestedModel = parsed.data.model;
+  const resolved = resolveModel(requestedModel);
+
+  if ('error' in resolved) {
+    return res.status(422).json({ error: 'unsupported_model', requested: resolved.requested });
+  }
+
+  const { model: resolvedModel, aliasUsed } = resolved;
 
   const { system, suspectEnvTrunc, fromEnv } = await resolveSystemPrompt();
   if (suspectEnvTrunc) {
@@ -262,12 +273,7 @@ app.post('/api/chat', async (req: Request<unknown, unknown, ChatRequestBody>, re
   if (DEBUG_ENABLED) {
     logDiagnostics(messagesFinal, resolvedModel, fromEnv);
     console.info('[MODEL][Requested]:', requestedModel ?? '(default)');
-    console.info(
-      '[MODEL][Resolved ]:',
-      resolvedModel,
-      aliasUsed ? `(alias ${aliasUsed})` : '',
-      warning ? `(warn ${warning})` : ''
-    );
+    console.info('[MODEL][Resolved ]:', resolvedModel, aliasUsed ? `(alias ${aliasUsed})` : '');
   }
 
   let completion: AsyncIterable<ChatCompletionChunk>;
@@ -279,35 +285,16 @@ app.post('/api/chat', async (req: Request<unknown, unknown, ChatRequestBody>, re
       stream: true
     });
   } catch (error) {
-    const status = (error as { status?: number })?.status ?? 500;
-    const code = (error as { code?: string })?.code ?? 'unknown_error';
-    const detail =
-      (error as { error?: { message?: string } })?.error?.message ?? (error as Error)?.message ?? 'OpenAI request failed';
-    console.error('[API][chat] erro', status, code, detail);
-
-    if (status === 404 || code === 'model_not_found') {
-      res.status(422).json({
-        error: 'model_not_found',
-        detail,
-        hint: 'Modelo solicitado não existe; utilize apenas chaves conhecidas (ex.: copy-vsl) ou deixe vazio.',
-        resolvedModel,
-        aliasUsed,
-        warning
-      });
-      return;
-    }
-
-    res.status(status).json({ error: code, detail });
-    return;
+    console.error('OpenAI error', error);
+    return res.status(502).json({
+      error: 'upstream_error',
+      message: 'Falha ao gerar resposta. Tente novamente.'
+    });
   }
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
-
-  if (warning) {
-    res.write(`data: ${JSON.stringify({ info: 'model_warning', warning, resolvedModel, aliasUsed })}\n\n`);
-  }
 
   try {
     for await (const chunk of completion) {
@@ -322,7 +309,7 @@ app.post('/api/chat', async (req: Request<unknown, unknown, ChatRequestBody>, re
   } catch (streamError) {
     console.error('[API][chat] erro durante stream', streamError);
     if (!res.headersSent) {
-      res.status(500).json({ error: 'stream_error', detail: 'Failed while streaming OpenAI response' });
+      res.status(502).json({ error: 'upstream_error', message: 'Falha ao gerar resposta. Tente novamente.' });
       return;
     }
     res.write(`data: ${JSON.stringify({ error: 'stream_error' })}\n\n`);
@@ -344,5 +331,3 @@ app.get(/.*/, (_req, res) => {
 app.listen(PORT, () => {
   console.log(`[API] listening on http://localhost:${PORT}`);
 });
-
-

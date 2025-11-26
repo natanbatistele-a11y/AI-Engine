@@ -6,7 +6,7 @@ Auditoria 2025-11-07:
 - O fetch do chat acontece aqui em `src/services/chatProvider.ts`, sempre apontando para `/api/chat` (fallback de `VITE_CHAT_API_URL`).
 - O backend local real mora em `server/index.ts` e injeta `{ role: "system" }` antes de chamar a OpenAI com `OPENAI_API_KEY`.
 - O system oficial fornecido pelo cliente vive apenas no backend (`server/prompts/system.private.ts`) e nunca e exposto no frontend.
-- Vite já proxia `/api` para `http://localhost:3001`, então não há chamadas externas por padrão.
+- Vite jo proxia `/api` para `http://localhost:3001`, entuo nuo ho chamadas externas por padruo.
 - Logs em dev (`VITE_SYSTEM_DEBUG=true`) mostram somente as roles disparadas pelo navegador para facilitar QA sem duplicar o system.
 */
 
@@ -113,6 +113,7 @@ export const requestProviderCompletion = async (
     headers: {
       'Content-Type': 'application/json'
     },
+    credentials: 'include',
     body: JSON.stringify({
       messages: payload.userMessages,
       model: payload.modelId
@@ -149,5 +150,3 @@ export const requestProviderCompletion = async (
   const reader = response.body.getReader();
   return parseSseEvents(reader, onDelta);
 };
-
-
