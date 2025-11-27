@@ -1,6 +1,15 @@
 export const ALLOWED_MODELS = {
   'gpt-4o-mini': { provider: 'openai', id: 'gpt-4o-mini' },
-  'gpt-4o': { provider: 'openai', id: 'gpt-4o' }
+  'gpt-4o': { provider: 'openai', id: 'gpt-4o' },
+  // Aliases usados pelo frontend/presets
+  'copy-vsl': { provider: 'openai', id: 'gpt-4o' },
+  'ads-feed': { provider: 'openai', id: 'gpt-4o' },
+  'story-3telas': { provider: 'openai', id: 'gpt-4o' },
+  'post-rapido': { provider: 'openai', id: 'gpt-4o' },
+  'video-curto': { provider: 'openai', id: 'gpt-4o' },
+  'image_realista': { provider: 'openai', id: 'gpt-4o' },
+  'image_criativa_design': { provider: 'openai', id: 'gpt-4o' },
+  'video_prompt_realismo': { provider: 'openai', id: 'gpt-4o' }
 } as const;
 
 export type AllowedModelKey = keyof typeof ALLOWED_MODELS;
